@@ -20,7 +20,7 @@ Render will host the FastAPI application (`api.py`) which acts as the gateway to
 
 2. **Configure the Service**:
    - **Name**: `trading-engine-api`
-   - **Environment**: `Python 3`
+   - **Environment**: `Python 3.11.9` (Set via `runtime.txt` or `PYTHON_VERSION` env var)
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn api:app --host 0.0.0.0 --port $PORT`
 
