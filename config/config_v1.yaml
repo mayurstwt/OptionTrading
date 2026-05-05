@@ -1,0 +1,33 @@
+trading_config:
+  paper_capital: 1000000
+  symbols: ["NIFTY", "BANKNIFTY"]
+  default_symbol: "NIFTY"
+  risk_limits:
+    max_position_size_lots: 3
+    max_concurrent_lots: 6
+    daily_loss_limit_pct: -1.5
+  
+entry_rules:
+  - rule_name: "short_straddle_morning"
+    enabled: true
+    strategy_type: "short_straddle"
+    time_window: ["09:20", "10:30"]
+    underlying_conditions:
+      - metric: "price"
+        operator: "between"
+        values: [24700, 25500]
+    position_sizing:
+      base_lots: 1
+
+exit_rules:
+  - rule_name: "profit_target_exit"
+    enabled: true
+    trigger: "any"
+    conditions:
+      - metric: "premium_change"
+        operator: "<="
+        threshold: -25
+  - rule_name: "time_stop_exit"
+    enabled: true
+    trigger: "absolute_time"
+    time: "15:15"
