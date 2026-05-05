@@ -1,7 +1,14 @@
 import time
 import logging
 from datetime import datetime
-from src.market_data.market_provider import YahooFinanceProvider, NSEScraperProvider, MultiMarketProvider, MarketDataProvider
+from src.market_data.market_provider import (
+    YahooFinanceProvider, 
+    NSEScraperProvider, 
+    NiftyIndicesProvider,
+    GoogleFinanceProvider,
+    MultiMarketProvider, 
+    MarketDataProvider
+)
 from src.market_data.market_cache import MarketCache
 from src.rules.rules_engine import RulesEngine
 from src.trading.paper_trader import PaperTrader
@@ -20,7 +27,7 @@ logger = logging.getLogger("TradingEngine")
 class TradingEngine:
     """
     Main orchestrator for the autonomous trading engine.
-    Updated to use Supabase and a Hybrid (Yahoo + NSE) market provider.
+    Updated to use Supabase and a Hybrid (NiftyIndices + Google + Yahoo + NSE) market provider.
     """
 
     def __init__(self, config_path: str = "config/config_v1.yaml", market_provider: MarketDataProvider = None):
@@ -28,11 +35,13 @@ class TradingEngine:
         self.db = SupabaseDatabase()
         self.market_cache = MarketCache()
         
-        # Setup Hybrid Market Provider
+        # Setup Ultra-Resilient Hybrid Market Provider
         if market_provider is None:
             self.market_provider = MultiMarketProvider([
-                YahooFinanceProvider(),
-                NSEScraperProvider()
+                NiftyIndicesProvider(),     # 1. Try official Nifty Indices API (fast & reliable)
+                GoogleFinanceProvider(),    # 2. Try Google Finance (highly reliable)
+                YahooFinanceProvider(),     # 3. Try Yahoo Finance
+                NSEScraperProvider()        # 4. Try NSE Scraper (last resort)
             ])
         else:
             self.market_provider = market_provider
