@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from src.db.supabase_db import SupabaseDatabase
-from src.db.models import Trade, Position
+from src.db.models import Trade, Position, WalletTransaction
 from src.market_data.market_cache import MarketCache
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,9 @@ class PaperTrader:
         
         # Update Position
         self._update_position(trade)
+        
+        # Block Margin in Wallet
+        self._handle_margin(trade, "BLOCK")
         
         logger.info(f"PAPER ORDER PLACED: {side} {quantity} lots of {instrument_key} @ {current_ltp}")
         return trade
@@ -92,8 +95,57 @@ class PaperTrader:
         # Remove from positions
         self.db.delete_position(instrument_key)
         
+        # Release Margin and Settle P&L
+        self._handle_margin(trade, "RELEASE")
+        self._settle_pnl(trade)
+        
         logger.info(f"PAPER POSITION CLOSED: {instrument_key} @ {current_ltp}. P&L: {trade.realized_pnl}")
         return trade
+
+    def _handle_margin(self, trade: Trade, action: str):
+        """Block or release margin in the wallet."""
+        try:
+            wallet = self.db.get_wallet()
+            # Simplified margin: 1L for sell, 20k for buy per lot
+            margin_per_lot = 100000 if trade.side == "SELL" else 20000
+            total_margin = margin_per_lot * trade.quantity
+            
+            if action == "BLOCK":
+                wallet.used_margin += total_margin
+                description = f"Margin Blocked: {trade.instrument_key} {trade.side}"
+                tx_type = "MARGIN_BLOCKED"
+            else:
+                wallet.used_margin -= total_margin
+                description = f"Margin Released: {trade.instrument_key} {trade.side}"
+                tx_type = "MARGIN_RELEASED"
+                
+            self.db.save_wallet(wallet)
+            self.db.save_wallet_transaction(WalletTransaction(
+                type=tx_type,
+                amount=-total_margin if action == "BLOCK" else total_margin,
+                description=description,
+                timestamp=datetime.now(),
+                reference_id=trade.trade_id
+            ))
+        except Exception as e:
+            logger.error(f"Failed to handle margin: {str(e)}")
+
+    def _settle_pnl(self, trade: Trade):
+        """Settle realized P&L to the wallet balance."""
+        try:
+            wallet = self.db.get_wallet()
+            wallet.balance += trade.realized_pnl
+            self.db.save_wallet(wallet)
+            
+            self.db.save_wallet_transaction(WalletTransaction(
+                type="PNL_SETTLEMENT",
+                amount=trade.realized_pnl,
+                description=f"P&L Settlement: {trade.instrument_key}",
+                timestamp=datetime.now(),
+                reference_id=trade.trade_id
+            ))
+        except Exception as e:
+            logger.error(f"Failed to settle P&L: {str(e)}")
 
     def _update_position(self, trade: Trade):
         """Update the paper_positions table."""

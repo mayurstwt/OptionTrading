@@ -49,3 +49,19 @@ class MarketSnapshot:
     oi: Optional[int] = None
     iv: Optional[float] = None
     timestamp: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class Wallet:
+    balance: float
+    used_margin: float = 0.0
+    updated_at: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class WalletTransaction:
+    type: str  # DEPOSIT, WITHDRAWAL, MARGIN_BLOCKED, MARGIN_RELEASED, PNL_SETTLEMENT
+    amount: float
+    description: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    reference_id: Optional[str] = None
+    wallet_id: Optional[int] = None
+    id: Optional[int] = None

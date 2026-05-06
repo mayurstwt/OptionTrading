@@ -3,7 +3,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from supabase import create_client, Client
-from src.db.models import Trade, Position, DailySummary, MarketSnapshot
+from src.db.models import Trade, Position, DailySummary, MarketSnapshot, Wallet, WalletTransaction
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -154,9 +154,89 @@ class SupabaseDatabase:
     def get_trades_by_date(self, date_str: str) -> List[Trade]:
         """Fetch all trades for a specific date (YYYY-MM-DD)."""
         try:
-            # Filtering by entry_time starting with the date
-            response = self.client.table("paper_trades").select("*").ilike("entry_time", f"{date_str}%").execute()
+            # Filtering by entry_time using range comparison for TIMESTAMPTZ
+            start_ts = f"{date_str}T00:00:00Z"
+            end_ts = f"{date_str}T23:59:59Z"
+            response = self.client.table("paper_trades").select("*").gte("entry_time", start_ts).lte("entry_time", end_ts).execute()
             return [self._row_to_trade(row) for row in response.data]
         except Exception as e:
             logger.error(f"Error fetching trades by date: {str(e)}")
+            return []
+
+    # Wallet & Transactions
+    def get_wallet(self) -> Wallet:
+        """Fetch current wallet balance."""
+        try:
+            response = self.client.table("wallet").select("*").eq("id", 1).execute()
+            if not response.data:
+                # Initialize wallet if it doesn't exist
+                from src.utils.config_loader import load_config
+                config = load_config("config/config_v1.yaml")
+                initial_capital = config.get("trading_config", {}).get("paper_capital", 1000000)
+                
+                wallet_data = {"id": 1, "balance": initial_capital, "used_margin": 0.0, "updated_at": datetime.now().isoformat()}
+                self.client.table("wallet").insert(wallet_data).execute()
+                
+                # Log initial deposit
+                self.save_wallet_transaction(WalletTransaction(
+                    type="DEPOSIT",
+                    amount=initial_capital,
+                    description="Initial Capital",
+                    timestamp=datetime.now()
+                ))
+                
+                return Wallet(balance=initial_capital, used_margin=0.0)
+            
+            row = response.data[0]
+            return Wallet(
+                balance=row['balance'],
+                used_margin=row['used_margin'],
+                updated_at=datetime.fromisoformat(row['updated_at'])
+            )
+        except Exception as e:
+            logger.error(f"Error fetching wallet from Supabase: {str(e)}")
+            return Wallet(balance=0.0, used_margin=0.0)
+
+    def save_wallet(self, wallet: Wallet):
+        """Update wallet balance."""
+        data = {
+            "balance": wallet.balance,
+            "used_margin": wallet.used_margin,
+            "updated_at": datetime.now().isoformat()
+        }
+        try:
+            self.client.table("wallet").update(data).eq("id", 1).execute()
+        except Exception as e:
+            logger.error(f"Error saving wallet to Supabase: {str(e)}")
+
+    def save_wallet_transaction(self, transaction: WalletTransaction):
+        """Record a new wallet transaction."""
+        data = {
+            "type": transaction.type,
+            "amount": transaction.amount,
+            "description": transaction.description,
+            "timestamp": transaction.timestamp.isoformat(),
+            "reference_id": transaction.reference_id,
+            "wallet_id": 1
+        }
+        try:
+            self.client.table("wallet_transactions").insert(data).execute()
+        except Exception as e:
+            logger.error(f"Error saving wallet transaction to Supabase: {str(e)}")
+
+    def get_wallet_transactions(self, limit: int = 50) -> List[WalletTransaction]:
+        """Fetch recent wallet transactions."""
+        try:
+            response = self.client.table("wallet_transactions").select("*").order("timestamp", desc=True).limit(limit).execute()
+            return [WalletTransaction(
+                id=row['id'],
+                type=row['type'],
+                amount=row['amount'],
+                description=row['description'],
+                timestamp=datetime.fromisoformat(row['timestamp']),
+                reference_id=row['reference_id'],
+                wallet_id=row['wallet_id']
+            ) for row in response.data]
+        except Exception as e:
+            logger.error(f"Error fetching wallet transactions from Supabase: {str(e)}")
             return []
