@@ -99,8 +99,8 @@ class RulesEngine:
     def _get_metric_value(self, metric: str) -> Optional[float]:
         # For now, only 'price' is supported for underlying
         if metric == "price":
-            # Assuming NIFTY 50 is the default underlying for now
-            return self.market_cache.get_ltp("NSE_INDEX|Nifty 50")
+            # Matches the symbol used in main.py cache
+            return self.market_cache.get_ltp("NIFTY")
         return None
 
     def _compare(self, val: Any, operator: str, target: Any) -> bool:

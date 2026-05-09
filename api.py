@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from main import TradingEngine
@@ -28,6 +29,23 @@ app.add_middleware(
 
 # Global engine instance
 engine = TradingEngine()
+
+async def background_trading_loop():
+    """Background task to run the trading cycle every 30 seconds."""
+    logger.info("Starting background trading loop...")
+    while True:
+        try:
+            # Run the synchronous cycle in a separate thread to avoid blocking the event loop
+            await asyncio.to_thread(engine.run_cycle)
+        except Exception as e:
+            logger.error(f"Error in background trading cycle: {str(e)}")
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def startup_event():
+    """Triggered when the FastAPI application starts."""
+    # Start the background trading loop
+    asyncio.create_task(background_trading_loop())
 
 class RuleUpdate(BaseModel):
     config_yaml: str
