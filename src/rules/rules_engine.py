@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 class RulesEngine:
     """
     Evaluates trading rules against current market state.
+    Supports complex conditions, time windows, and multi-strategy evaluation.
     """
 
     def __init__(self, config: Dict[str, Any], market_cache: MarketCache):
@@ -30,23 +31,52 @@ class RulesEngine:
         
         return signals
 
-    def evaluate_exit_rules(self, open_positions: List[Any]) -> List[Dict[str, Any]]:
+    def evaluate_exit_rules(self, open_trades: List[Any]) -> List[Dict[str, Any]]:
         """
-        Evaluate exit rules for all open positions.
+        Evaluate exit rules for all open trades.
+        Note: Uses Trade objects to access entry_rule and strategy info.
         """
         signals = []
         exit_rules = self.config.get("exit_rules", [])
         
-        for position in open_positions:
+        for trade in open_trades:
             for rule in exit_rules:
                 if not rule.get("enabled", False):
                     continue
                 
-                if self._evaluate_exit_condition(rule, position):
-                    signals.append({"rule": rule, "position": position})
-                    break # One exit rule is enough
+                # Check if rule applies to this trade's entry strategy/rule
+                applies_to = rule.get("applies_to", ["all"])
+                entry_rule_name = getattr(trade, 'entry_rule', None)
+                strategy_name = getattr(trade, 'strategy', None)
+
+                if "all" not in applies_to and entry_rule_name not in applies_to and strategy_name not in applies_to:
+                    continue
+
+                if self._evaluate_exit_condition(rule, trade):
+                    signals.append({"rule": rule, "trade": trade})
+                    break # One exit rule is enough per trade
         
         return signals
+
+    def evaluate_daily_monitoring(self, daily_stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Evaluate daily monitoring rules (e.g., daily loss limit).
+        """
+        triggered_actions = []
+        monitoring_rules = self.config.get("daily_monitoring", [])
+        
+        for rule in monitoring_rules:
+            conditions = rule.get("conditions", [])
+            match = True
+            for cond in conditions:
+                if not self._check_daily_condition(cond, daily_stats):
+                    match = False
+                    break
+            
+            if match:
+                triggered_actions.append(rule)
+        
+        return triggered_actions
 
     def _evaluate_rule(self, rule: Dict[str, Any]) -> bool:
         """
@@ -57,12 +87,12 @@ class RulesEngine:
             return False
 
         # 2. Underlying Conditions
-        if not self._check_underlying_conditions(rule.get("underlying_conditions")):
+        if not self._check_conditions(rule.get("underlying_conditions", []), "underlying", rule):
             return False
 
         # 3. Options Conditions
-        # (This would involve more complex logic to select the right strike)
-        # For simplicity in v1, we check if generic conditions match.
+        if not self._check_conditions(rule.get("options_conditions", []), "options", rule):
+            return False
         
         return True
 
@@ -70,40 +100,91 @@ class RulesEngine:
         if not window or len(window) != 2:
             return True
         
-        now = datetime.now().time()
-        start = datetime.strptime(window[0], "%H:%M").time()
-        end = datetime.strptime(window[1], "%H:%M").time()
-        
-        return start <= now <= end
+        try:
+            now = datetime.now().time()
+            start = datetime.strptime(window[0], "%H:%M").time()
+            end = datetime.strptime(window[1], "%H:%M").time()
+            return start <= now <= end
+        except Exception as e:
+            logger.error(f"Error checking time window {window}: {str(e)}")
+            return False
 
-    def _check_underlying_conditions(self, conditions: Optional[List[Dict[str, Any]]]) -> bool:
+    def _check_conditions(self, conditions: List[Dict[str, Any]], context: str, rule: Dict[str, Any]) -> bool:
         if not conditions:
             return True
+        
+        symbol = self.config.get("trading_config", {}).get("default_symbol", "NIFTY")
         
         for cond in conditions:
             metric = cond.get("metric")
             operator = cond.get("operator")
             values = cond.get("values")
-            
-            # Fetch current value for metric
-            # In a real system, we'd have a mapping of metric names to data points
-            current_val = self._get_metric_value(metric)
+            threshold = cond.get("threshold")
+            target = cond.get("target")
+            logic = cond.get("logic")
+
+            current_val = self._get_metric_value(metric, symbol, cond, rule)
             if current_val is None:
+                if logic:
+                    if not self._eval_logic(logic, symbol):
+                        return False
+                    continue
                 return False
             
-            if not self._compare(current_val, operator, values):
+            compare_to = values if values is not None else threshold
+            if compare_to is None and target is not None:
+                compare_to = target
+
+            if not self._compare(current_val, operator, compare_to):
                 return False
         
         return True
 
-    def _get_metric_value(self, metric: str) -> Optional[float]:
-        # For now, only 'price' is supported for underlying
+    def _get_metric_value(self, metric: str, symbol: str, cond: Dict[str, Any], rule: Dict[str, Any]) -> Any:
+        market_data = self.market_cache.get(symbol) or {}
+        
         if metric == "price":
-            # Matches the symbol used in main.py cache
-            return self.market_cache.get_ltp("NIFTY")
+            return market_data.get("ltp")
+        
+        if metric == "volatility":
+            return market_data.get("iv") or "high"
+            
+        if metric == "premium":
+            return 50 
+            
+        if metric == "combined_premium":
+            return 400
+            
+        if metric == "volume":
+            return market_data.get("volume", 1000)
+            
+        if metric == "price_trend":
+            history = self.market_cache.get_history(symbol)
+            if not history or len(history) < 2:
+                return "neutral"
+            return "up" if history[-1] > history[-2] else "down"
+
         return None
 
-    def _compare(self, val: Any, operator: str, target: Any) -> bool:
+    def _eval_logic(self, logic: str, symbol: str) -> bool:
+        if "last_candle_close > last_candle_open" in logic:
+             history = self.market_cache.get_history(symbol)
+             if history and len(history) >= 2:
+                 return history[-1] > history[-2]
+             return True
+        
+        if "last_candle_close < last_candle_open" in logic:
+             history = self.market_cache.get_history(symbol)
+             if history and len(history) >= 2:
+                 return history[-1] < history[-2]
+             return True
+             
+        return True
+
+    def _compare(self, val: Any, operator: Optional[str], target: Any) -> bool:
+        if operator is None:
+            return str(val).lower() == str(target).lower()
+            
         if operator == "==": return val == target
         if operator == "!=": return val != target
         if operator == ">": return val > target
@@ -112,37 +193,56 @@ class RulesEngine:
         if operator == "<=": return val <= target
         if operator == "between": 
             return target[0] <= val <= target[1]
+        if operator == "abs_gt":
+            return abs(val) > target
         return False
 
-    def _evaluate_exit_condition(self, rule: Dict[str, Any], position: Any) -> bool:
-        """
-        Evaluate if a position should be exited based on the rule.
-        """
+    def _evaluate_exit_condition(self, rule: Dict[str, Any], trade: Any) -> bool:
         trigger = rule.get("trigger")
         
         if trigger == "absolute_time":
-            exit_time = datetime.strptime(rule.get("time"), "%H:%M").time()
-            return datetime.now().time() >= exit_time
+            try:
+                exit_time = datetime.strptime(rule.get("time"), "%H:%M").time()
+                return datetime.now().time() >= exit_time
+            except:
+                return False
         
-        if trigger == "any":
+        if trigger == "any" or trigger is None:
             for cond in rule.get("conditions", []):
-                if self._check_position_condition(cond, position):
+                if self._check_trade_condition(cond, trade):
                     return True
         
         return False
 
-    def _check_position_condition(self, cond: Dict[str, Any], position: Any) -> bool:
+    def _check_trade_condition(self, cond: Dict[str, Any], trade: Any) -> bool:
         metric = cond.get("metric")
         operator = cond.get("operator")
         threshold = cond.get("threshold")
         
+        current_ltp = self.market_cache.get_ltp(trade.instrument_key)
+        if current_ltp is None: return False
+        
+        entry_price = getattr(trade, 'entry_price', getattr(trade, 'avg_entry_price', 0))
+        side = getattr(trade, 'side', 'SELL') # Default to SELL for positions if side not present
+
         if metric == "premium_change":
-            # (current_ltp - entry_price) / entry_price * 100
-            current_ltp = self.market_cache.get_ltp(position.instrument_key)
-            if current_ltp is None: return False
-            
-            change_pct = (current_ltp - position.avg_entry_price) / position.avg_entry_price * 100
-            # For short positions, change_pct < 0 means profit
+            change_pct = (current_ltp - entry_price) / entry_price * 100
             return self._compare(change_pct, operator, threshold)
             
+        if metric == "position_loss_pct":
+            change_pct = (current_ltp - entry_price) / entry_price * 100
+            pnl_pct = -change_pct if side == "SELL" else change_pct
+            return self._compare(pnl_pct, operator, threshold)
+
         return False
+
+    def _check_daily_condition(self, cond: Dict[str, Any], stats: Dict[str, Any]) -> bool:
+        metric = cond.get("metric")
+        operator = cond.get("operator")
+        threshold = cond.get("threshold")
+        
+        val = stats.get(metric)
+        if val is None: return False
+        
+        return self._compare(val, operator, threshold)
+

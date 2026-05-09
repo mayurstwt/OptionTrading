@@ -16,7 +16,7 @@ class RiskVerdict:
 class RiskManager:
     """
     Enforces risk constraints on trading operations.
-    Updated to use SupabaseDatabase.
+    Updated to handle all-day trading risk limits.
     """
 
     def __init__(self, config: Dict[str, Any], db: SupabaseDatabase):
@@ -37,7 +37,7 @@ class RiskManager:
         # 2. Max Concurrent Lots
         current_positions = self.db.get_positions()
         current_total_lots = sum(abs(p.net_quantity) for p in current_positions)
-        max_concurrent_lots = self.risk_limits.get("max_concurrent_lots", 6)
+        max_concurrent_lots = self.risk_limits.get("max_concurrent_lots", 10)
         
         if current_total_lots + quantity > max_concurrent_lots:
             remaining_lots = max_concurrent_lots - current_total_lots
@@ -46,17 +46,32 @@ class RiskManager:
             return RiskVerdict(status="REDUCED_SIZE", reason=f"Total lots would exceed {max_concurrent_lots}", 
                                suggested_quantity=remaining_lots)
 
-        # 3. Daily Loss Limit
+        # 3. Max Trades Per Day
+        if not self._check_max_trades_limit():
+            return RiskVerdict(status="BLOCKED", reason="Max trades per day reached")
+
+        # 4. Daily Loss Limit
         if not self._check_daily_loss_limit():
             return RiskVerdict(status="BLOCKED", reason="Daily loss limit exceeded")
 
         return RiskVerdict(status="APPROVED")
 
+    def _check_max_trades_limit(self) -> bool:
+        """Check if max trades per day has been reached."""
+        max_trades = self.risk_limits.get("max_trades_per_day", 15)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        trades = self.db.get_trades_by_date(today_str)
+        
+        if len(trades) >= max_trades:
+            logger.warning(f"Max trades per day reached: {len(trades)} >= {max_trades}")
+            return False
+        return True
+
     def _check_daily_loss_limit(self) -> bool:
         """
         Calculate daily P&L and compare with limit using Supabase.
         """
-        daily_loss_limit_pct = self.risk_limits.get("daily_loss_limit_pct", -1.5)
+        daily_loss_limit_pct = self.risk_limits.get("daily_loss_limit_pct", -2.0)
         capital = self.config.get("paper_capital", 1000000)
         limit_amount = (daily_loss_limit_pct / 100) * capital
 

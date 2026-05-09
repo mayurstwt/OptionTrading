@@ -62,48 +62,104 @@ class TradingEngine:
             # 1. Update Market Data and persist it
             self._update_market_data()
 
-            # 2. Evaluate Exit Rules
-            open_positions = self.db.get_positions()
-            exit_signals = self.rules_engine.evaluate_exit_rules(open_positions)
+            # 2. Calculate current stats for monitoring
+            daily_stats = self._get_current_daily_stats()
+            
+            # 3. Evaluate Daily Monitoring Rules
+            monitoring_signals = self.rules_engine.evaluate_daily_monitoring(daily_stats)
+            halt_trading = False
+            for signal in monitoring_signals:
+                action = signal.get("action")
+                logger.warning(f"MONITORING ALERT: {signal['name']} - Action: {action}")
+                if action == "HALT_NEW_ENTRIES" or action == "BLOCK_NEW_ENTRIES":
+                    halt_trading = True
+                if action == "CLOSE_ALL_POSITIONS" or action == "FORCE_EXIT_ALL":
+                    self._close_all_positions()
+                    halt_trading = True
+
+            # 4. Evaluate Exit Rules
+            open_trades = self.db.get_open_trades()
+            exit_signals = self.rules_engine.evaluate_exit_rules(open_trades)
             for signal in exit_signals:
                 self.paper_trader.close_position(
-                    instrument_key=signal['position'].instrument_key,
+                    instrument_key=signal['trade'].instrument_key,
                     exit_rule=signal['rule']['rule_name']
                 )
 
-            # 3. Evaluate Entry Rules
-            entry_signals = self.rules_engine.evaluate_entry_rules()
-            for signal in entry_signals:
-                # Default to symbols mentioned in config or standard ones
-                symbol = self.config.get("trading_config", {}).get("default_symbol", "NIFTY")
-                
-                risk_verdict = self.risk_manager.check_risk(
-                    instrument_key=symbol,
-                    side="SELL", 
-                    quantity=signal['position_sizing']['base_lots']
-                )
+            # 5. Evaluate Entry Rules
+            if not halt_trading:
+                entry_signals = self.rules_engine.evaluate_entry_rules()
+                for signal in entry_signals:
+                    # Determine symbol based on strategy or default
+                    symbol = self._get_symbol_for_strategy(signal)
+                    
+                    risk_verdict = self.risk_manager.check_risk(
+                        instrument_key=symbol,
+                        side="SELL", 
+                        quantity=signal['position_sizing']['base_lots']
+                    )
 
-                if risk_verdict.status == "APPROVED":
-                    self.paper_trader.place_order(
-                        strategy=signal['strategy_type'],
-                        instrument_key=symbol,
-                        side="SELL",
-                        quantity=signal['position_sizing']['base_lots'],
-                        entry_rule=signal['rule_name']
-                    )
-                elif risk_verdict.status == "REDUCED_SIZE":
-                     self.paper_trader.place_order(
-                        strategy=signal['strategy_type'],
-                        instrument_key=symbol,
-                        side="SELL",
-                        quantity=risk_verdict.suggested_quantity,
-                        entry_rule=signal['rule_name']
-                    )
+                    if risk_verdict.status == "APPROVED":
+                        self.paper_trader.place_order(
+                            strategy=signal['strategy_type'],
+                            instrument_key=symbol,
+                            side="SELL",
+                            quantity=signal['position_sizing']['base_lots'],
+                            entry_rule=signal['rule_name']
+                        )
+                    elif risk_verdict.status == "REDUCED_SIZE":
+                         self.paper_trader.place_order(
+                            strategy=signal['strategy_type'],
+                            instrument_key=symbol,
+                            side="SELL",
+                            quantity=risk_verdict.suggested_quantity,
+                            entry_rule=signal['rule_name']
+                        )
             
             logger.info("Trading cycle completed.")
         except Exception as e:
             logger.error(f"Error in trading cycle: {str(e)}")
             raise e
+
+    def _get_current_daily_stats(self) -> dict[str, any]:
+        """Calculate real-time stats for monitoring."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        trades = self.db.get_trades_by_date(today_str)
+        realized_pnl = sum(t.realized_pnl for t in trades if t.status == "CLOSED")
+        
+        open_positions = self.db.get_positions()
+        unrealized_pnl = 0.0
+        total_lots = 0
+        for pos in open_positions:
+            total_lots += abs(pos.net_quantity)
+            current_ltp = self.market_cache.get_ltp(pos.instrument_key)
+            if current_ltp:
+                price_diff = current_ltp - pos.avg_entry_price
+                unrealized_pnl += price_diff * pos.net_quantity
+
+        capital = self.config.get("trading_config", {}).get("paper_capital", 1000000)
+        
+        return {
+            "daily_realized_pnl_pct": (realized_pnl / capital) * 100,
+            "daily_unrealized_pnl_pct": (unrealized_pnl / capital) * 100,
+            "total_concurrent_lots": total_lots
+        }
+
+    def _close_all_positions(self):
+        """Emergency close of all open positions."""
+        open_positions = self.db.get_positions()
+        for pos in open_positions:
+            self.paper_trader.close_position(pos.instrument_key, exit_rule="EMERGENCY_EXIT")
+
+    def _get_symbol_for_strategy(self, rule: dict[str, any]) -> str:
+        """Determine which symbol to trade for a given rule."""
+        symbol_rules = self.config.get("symbol_rules", {})
+        rule_name = rule.get("rule_name")
+        if rule_name in symbol_rules:
+            allowed = symbol_rules[rule_name].get("applies_to", [])
+            if allowed: return allowed[0]
+        
+        return self.config.get("trading_config", {}).get("default_symbol", "NIFTY")
 
     def calculate_daily_pnl(self):
         """
@@ -143,22 +199,18 @@ class TradingEngine:
 
     def _update_market_data(self):
         """Fetch latest quotes for subscribed symbols and save snapshot to Supabase."""
-        # We can configure symbols in config. For now, default to NIFTY and BANKNIFTY
         symbols = self.config.get("trading_config", {}).get("symbols", ["NIFTY", "BANKNIFTY"])
         
         for symbol in symbols:
             ltp = self.market_provider.get_quote(symbol)
             if ltp:
                 self.market_cache.update(symbol, {"ltp": ltp})
-                
-                # Save snapshot to Supabase as requested ("store it in data")
                 snapshot = MarketSnapshot(
                     instrument_key=symbol,
                     ltp=ltp,
                     timestamp=datetime.now()
                 )
                 self.db.save_market_snapshot(snapshot)
-                
                 logger.info(f"Updated and persisted LTP for {symbol}: {ltp}")
             else:
                 logger.warning(f"Could not update LTP for {symbol}")
